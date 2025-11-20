@@ -1,7 +1,7 @@
 FROM python:3.9-slim-bullseye
 
 # Set working directory
-WORKDIR /mfa_api
+WORKDIR /app
 
 # Install system dependencies for MFA and audio processing
 RUN apt-get update && apt-get install -y \
