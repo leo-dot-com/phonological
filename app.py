@@ -4,13 +4,14 @@ import os
 import tempfile
 import json
 import logging
-import speech_recognition as sr
 import librosa
 import numpy as np
 from typing import Dict, List, Any
 import time
 import soundfile as sf
 from pydub import AudioSegment
+import requests
+import io
 
 app = Flask(__name__)
 CORS(app)
@@ -21,9 +22,8 @@ logger = logging.getLogger(__name__)
 
 class PhonologicalAnalyzer:
     def __init__(self):
-        self.recognizer = sr.Recognizer()
-        self.recognizer.energy_threshold = 300
-        self.recognizer.dynamic_energy_threshold = True
+        # No recognizer initialization needed for Whisper
+        pass
         
     def convert_audio_format(self, input_path: str) -> str:
         """Convert audio to WAV format and return path"""
@@ -36,82 +36,116 @@ class PhonologicalAnalyzer:
             audio = AudioSegment.from_file(input_path)
             audio = audio.set_frame_rate(16000).set_channels(1)
             audio.export(output_path, format="wav")
+            logger.info(f"Audio converted to WAV: {output_path}")
             return output_path
             
         except Exception as e:
             logger.error(f"Audio conversion error: {e}")
-            # Fallback: use soundfile
-            try:
-                audio, sample_rate = librosa.load(input_path, sr=16000, mono=True)
-                sf.write(output_path, audio, 16000)
-                return output_path
-            except Exception as e2:
-                logger.error(f"Fallback audio conversion failed: {e2}")
-                return None
+            return None
     
-    def transcribe_audio(self, audio_path: str) -> str:
-        """Transcribe audio using Google Speech Recognition"""
-        converted_path = None
+    def transcribe_with_whisper(self, audio_path: str) -> str:
+        """Transcribe audio using Whisper API"""
         try:
-            # Convert to WAV first
+            # Use the same Whisper service as read_aloud component
+            whisper_url = "https://readaloud-production.up.railway.app/transcribe"
+            
+            with open(audio_path, 'rb') as audio_file:
+                files = {'audio': audio_file}
+                response = requests.post(whisper_url, files=files, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    transcription = result.get('transcription', '').strip()
+                    logger.info(f"Whisper transcription: '{transcription}'")
+                    return transcription.lower()
+                else:
+                    logger.warning(f"Whisper API returned error: {result.get('error')}")
+            else:
+                logger.error(f"Whisper API HTTP error: {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"Whisper transcription error: {e}")
+        
+        return ""
+    
+    def transcribe_with_google_fallback(self, audio_path: str) -> str:
+        """Fallback transcription using speech_recognition"""
+        try:
+            import speech_recognition as sr
+            recognizer = sr.Recognizer()
+            recognizer.energy_threshold = 300
+            recognizer.dynamic_energy_threshold = True
+            
             converted_path = self.convert_audio_format(audio_path)
             if not converted_path:
                 return ""
             
             with sr.AudioFile(converted_path) as source:
-                # Adjust for ambient noise and record
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = self.recognizer.record(source)
+                # Adjust for ambient noise
+                recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                audio = recognizer.record(source)
                 
-                # Try Google Speech Recognition
-                transcription = self.recognizer.recognize_google(audio)
+                # Try Google Speech Recognition with shorter timeout
+                transcription = recognizer.recognize_google(audio, language='en-US', show_all=False)
+                logger.info(f"Google transcription: '{transcription}'")
                 return transcription.lower()
                 
-        except sr.UnknownValueError:
-            logger.warning("Google Speech Recognition could not understand audio")
-            return ""
-        except sr.RequestError as e:
-            logger.warning(f"Could not request results from Google Speech Recognition service; {e}")
-            return ""
         except Exception as e:
-            logger.error(f"Transcription error: {e}")
+            logger.warning(f"Google fallback failed: {e}")
             return ""
         finally:
-            # Clean up temporary file
             if converted_path and os.path.exists(converted_path):
                 os.unlink(converted_path)
+    
+    def transcribe_audio(self, audio_path: str) -> str:
+        """Main transcription with multiple fallbacks"""
+        logger.info("Starting audio transcription...")
+        
+        # First try Whisper (more reliable)
+        transcription = self.transcribe_with_whisper(audio_path)
+        if transcription:
+            return transcription
+        
+        # Fallback to Google
+        logger.info("Whisper failed, trying Google fallback...")
+        transcription = self.transcribe_with_google_fallback(audio_path)
+        if transcription:
+            return transcription
+        
+        logger.warning("All transcription methods failed")
+        return ""
     
     def analyze_audio_features(self, audio_path: str) -> Dict[str, Any]:
         """Analyze basic audio features"""
         try:
             y, sr = librosa.load(audio_path, sr=16000)
-            
-            # Extract features
             duration = len(y) / sr
+            
+            # Basic audio analysis
             rms_energy = np.mean(librosa.feature.rms(y=y))
             spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
-            zero_crossing_rate = np.mean(librosa.feature.zero_crossing_rate(y=y))
             
-            # Detect pauses/silence
+            # Voice activity detection
             frame_length = 1024
             hop_length = 256
             rms_frames = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-            silence_threshold = np.mean(rms_frames) * 0.1
-            silent_frames = np.sum(rms_frames < silence_threshold)
-            pause_ratio = silent_frames / len(rms_frames)
+            silence_threshold = np.percentile(rms_frames, 20)  # Use 20th percentile as threshold
+            voice_frames = np.sum(rms_frames > silence_threshold)
+            voice_ratio = voice_frames / len(rms_frames) if len(rms_frames) > 0 else 0
+            
+            logger.info(f"Audio features - Duration: {duration:.2f}s, Voice ratio: {voice_ratio:.2f}")
             
             return {
                 'duration': duration,
                 'rms_energy': float(rms_energy),
                 'spectral_centroid': float(spectral_centroid),
-                'zero_crossing_rate': float(zero_crossing_rate),
-                'pause_ratio': float(pause_ratio),
-                'total_frames': len(rms_frames),
-                'silent_frames': int(silent_frames)
+                'voice_ratio': float(voice_ratio),
+                'has_audio': duration > 0.1 and voice_ratio > 0.1
             }
         except Exception as e:
             logger.error(f"Audio feature analysis error: {e}")
-            return {}
+            return {'has_audio': False}
     
     def calculate_accuracy(self, actual: str, expected: str) -> float:
         """Calculate accuracy with fuzzy matching"""
@@ -125,27 +159,26 @@ class PhonologicalAnalyzer:
         if actual_clean == expected_clean:
             return 1.0
         
-        # Partial match based on word overlap
+        # Remove common filler words and noise
+        filler_words = ['um', 'uh', 'ah', 'er', 'like', 'so']
+        for filler in filler_words:
+            actual_clean = actual_clean.replace(filler, '')
+        actual_clean = ' '.join(actual_clean.split())  # Normalize spaces
+        
+        # Check if expected is contained in actual
+        if expected_clean in actual_clean:
+            return 0.9
+        
+        # Word-based similarity for multi-word responses
         actual_words = set(actual_clean.split())
         expected_words = set(expected_clean.split())
         
-        if not expected_words:
-            return 0.0
+        if expected_words:
+            common_words = actual_words.intersection(expected_words)
+            similarity = len(common_words) / len(expected_words)
+            return round(similarity, 2)
         
-        # Calculate Jaccard similarity
-        intersection = actual_words.intersection(expected_words)
-        union = actual_words.union(expected_words)
-        
-        if not union:
-            return 0.0
-            
-        similarity = len(intersection) / len(union)
-        
-        # Bonus for substring matches
-        if expected_clean in actual_clean:
-            similarity = max(similarity, 0.7)
-        
-        return round(similarity, 2)
+        return 0.0
     
     def detect_phonological_errors(self, actual: str, expected: str, task_type: str) -> List[str]:
         """Detect phonological error patterns"""
@@ -157,50 +190,74 @@ class PhonologicalAnalyzer:
         actual_lower = actual.lower()
         expected_lower = expected.lower()
         
-        # Common error patterns
+        # Common error patterns by task type
         if task_type == 'phoneme_deletion':
             if expected_lower not in actual_lower:
                 errors.append('incorrect_deletion')
-            if len(actual_lower) > len(expected_lower) + 2:
-                errors.append('extra_phonemes')
+            # Check if they said the original word instead
+            original_word = request.form.get('original_word', '').lower()
+            if original_word and original_word in actual_lower:
+                errors.append('said_original_word')
                 
         elif task_type == 'phoneme_blending':
             if expected_lower not in actual_lower:
                 errors.append('blending_difficulty')
-            # Check for segmented production
-            if any(sep in actual_lower for sep in ['.', ',', ' and ', ' then ']):
-                errors.append('segmented_production')
+            # Check for saying phonemes separately
+            phonemes = request.form.get('phonemes', '[]')
+            try:
+                phoneme_list = json.loads(phonemes)
+                if any(phoneme in actual_lower for phoneme in phoneme_list):
+                    errors.append('said_individual_phonemes')
+            except:
+                pass
                 
         elif task_type == 'nonword_repetition':
             if actual_lower != expected_lower:
                 errors.append('repetition_error')
-            # Check for common substitutions
-            substitutions = [
-                ('blom', 'blob'), ('tekip', 'tepid'), 
-                ('strin', 'string'), ('plaff', 'plaft')
-            ]
-            for wrong, right in substitutions:
-                if wrong in expected_lower and right in actual_lower:
-                    errors.append('phoneme_substitution')
-                    break
+            # Check for real word substitutions
+            real_word_substitutions = {
+                'blom': ['blob', 'bloom', 'blimp'],
+                'tekip': ['tepid', 'take it', 'teacup'],
+                'strin': ['string', 'strain', 'strand'],
+                'plaff': ['plaft', 'plough', 'flaff'],
+                'grommet': ['grommet', 'gromit', 'grommet']
+            }
+            if expected_lower in real_word_substitutions:
+                for sub in real_word_substitutions[expected_lower]:
+                    if sub in actual_lower:
+                        errors.append('real_word_substitution')
+                        break
         
-        # General error patterns
-        if len(actual_lower) < len(expected_lower) * 0.7:
-            errors.append('truncated_response')
-        elif len(actual_lower) > len(expected_lower) * 1.5:
-            errors.append('elongated_response')
-            
         return errors
     
     def analyze_phonological_task(self, audio_path: str, task_type: str, expected: str, **kwargs) -> Dict[str, Any]:
         """Main analysis function for all phonological tasks"""
         start_time = time.time()
         
+        # First, analyze audio features to check if we have valid audio
+        audio_features = self.analyze_audio_features(audio_path)
+        
+        if not audio_features.get('has_audio', False):
+            return {
+                'success': False,
+                'error': 'No audible speech detected. Please check your microphone and try again.',
+                'audio_features': audio_features
+            }
+        
         # Transcribe audio
         transcription = self.transcribe_audio(audio_path)
         
-        # Analyze audio features
-        audio_features = self.analyze_audio_features(audio_path)
+        # If no transcription but we have audio, provide a helpful message
+        if not transcription:
+            return {
+                'success': False,
+                'error': 'Speech was detected but could not be understood. Please speak more clearly and try again.',
+                'audio_features': audio_features,
+                'debug_info': {
+                    'duration': audio_features.get('duration', 0),
+                    'voice_ratio': audio_features.get('voice_ratio', 0)
+                }
+            }
         
         # Calculate accuracy
         accuracy_score = self.calculate_accuracy(transcription, expected)
@@ -208,13 +265,6 @@ class PhonologicalAnalyzer:
         # Detect errors
         error_patterns = self.detect_phonological_errors(transcription, expected, task_type)
         
-        # Calculate confidence score
-        confidence = accuracy_score
-        if audio_features.get('pause_ratio', 0) > 0.3:
-            confidence *= 0.8  # Penalize for too many pauses
-        if audio_features.get('duration', 0) > 10:
-            confidence *= 0.9  # Penalize for very long responses
-            
         processing_time = time.time() - start_time
         
         return {
@@ -223,34 +273,37 @@ class PhonologicalAnalyzer:
             'expected_response': expected,
             'actual_transcription': transcription,
             'accuracy_score': accuracy_score,
-            'confidence_score': round(confidence, 2),
+            'confidence_score': round(accuracy_score, 2),
             'processing_time_ms': int(processing_time * 1000),
             'error_patterns': error_patterns,
             'audio_features': audio_features,
-            'analysis_notes': self.generate_analysis_notes(transcription, expected, error_patterns, accuracy_score)
+            'analysis_notes': self.generate_analysis_notes(transcription, expected, error_patterns, accuracy_score),
+            'debug_info': {
+                'transcription_method': 'whisper',
+                'audio_duration': audio_features.get('duration', 0)
+            }
         }
     
     def generate_analysis_notes(self, transcription: str, expected: str, errors: List[str], accuracy: float) -> str:
         """Generate human-readable analysis notes"""
-        if not transcription:
-            return "No speech was detected in the recording. Please try again in a quieter environment."
-        
         if accuracy >= 0.9:
-            return "Excellent performance! The response was clear and accurate."
+            return "Excellent! Clear and accurate response."
         elif accuracy >= 0.7:
-            return "Good performance with minor variations from the expected response."
+            return "Good attempt with minor variations."
         elif accuracy >= 0.5:
-            return "Moderate performance. Some difficulty with the phonological task was observed."
+            return "Moderate accuracy. Some phonological difficulty detected."
         else:
-            return "Significant difficulty with the phonological task. Consider additional practice and assessment."
+            return "Significant difficulty with the task. Additional practice recommended."
         
-        # Add specific notes based on error patterns
-        if 'segmented_production' in errors:
-            return "The sounds were produced separately rather than blended together smoothly."
-        elif 'incorrect_deletion' in errors:
-            return "The target phoneme was not correctly deleted from the word."
+        # Add specific feedback based on errors
+        if 'said_original_word' in errors:
+            return "You said the original word instead of deleting the target sound."
+        elif 'said_individual_phonemes' in errors:
+            return "You said the sounds separately instead of blending them together."
+        elif 'real_word_substitution' in errors:
+            return "You substituted a real word for the nonsense word."
         
-        return "Analysis completed successfully."
+        return "Analysis completed."
 
 # Global analyzer instance
 analyzer = PhonologicalAnalyzer()
@@ -269,11 +322,21 @@ def analyze_phonological():
         if not task_type or not expected_response:
             return jsonify({'success': False, 'error': 'Missing task_type or expected_response'}), 400
         
-        logger.info(f"Processing {task_type} task, expected: {expected_response}")
+        logger.info(f"Processing {task_type} task, expected: '{expected_response}'")
         
         # Validate file
         if audio_file.filename == '':
             return jsonify({'success': False, 'error': 'No selected file'}), 400
+        
+        # Check file size
+        audio_file.seek(0, 2)  # Seek to end
+        file_size = audio_file.tell()
+        audio_file.seek(0)  # Reset to beginning
+        
+        if file_size == 0:
+            return jsonify({'success': False, 'error': 'Empty audio file'}), 400
+        
+        logger.info(f"Audio file size: {file_size} bytes")
         
         # Save audio to temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_audio:
@@ -288,13 +351,17 @@ def analyze_phonological():
                 additional_params['remove_phoneme'] = request.form.get('remove_phoneme', '')
             elif task_type == 'phoneme_blending':
                 phonemes_json = request.form.get('phonemes', '[]')
-                additional_params['phonemes'] = json.loads(phonemes_json)
+                additional_params['phonemes'] = phonemes_json
             
             result = analyzer.analyze_phonological_task(
                 temp_path, task_type, expected_response, **additional_params
             )
             
-            logger.info(f"Analysis completed: {result['accuracy_score']:.2f} accuracy")
+            if result['success']:
+                logger.info(f"Analysis successful: '{result['actual_transcription']}' -> {result['accuracy_score']:.2f} accuracy")
+            else:
+                logger.warning(f"Analysis failed: {result['error']}")
+                
             return jsonify(result)
             
         except Exception as e:
@@ -316,18 +383,61 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'phonological-analysis',
-        'version': '1.0.0',
-        'timestamp': time.time()
+        'version': '1.1.0',
+        'timestamp': time.time(),
+        'features': ['whisper_transcription', 'audio_analysis', 'phonological_error_detection']
     })
+
+@app.route('/debug-audio', methods=['POST'])
+def debug_audio():
+    """Debug endpoint to check audio file"""
+    try:
+        if 'audio' not in request.files:
+            return jsonify({'error': 'No audio file'}), 400
+        
+        audio_file = request.files['audio']
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_audio:
+            audio_file.save(temp_audio.name)
+            temp_path = temp_audio.name
+        
+        try:
+            # Analyze audio features
+            features = analyzer.analyze_audio_features(temp_path)
+            
+            # Try to get duration using multiple methods
+            try:
+                audio = AudioSegment.from_file(temp_path)
+                pydub_duration = len(audio) / 1000.0
+            except Exception as e:
+                pydub_duration = 0
+                logger.warning(f"PyDub duration failed: {e}")
+            
+            return jsonify({
+                'file_size': os.path.getsize(temp_path),
+                'audio_features': features,
+                'pydub_duration': pydub_duration,
+                'has_audio': features.get('has_audio', False) or pydub_duration > 0.1
+            })
+            
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+                
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def home():
     """Home endpoint"""
     return jsonify({
         'message': 'Phonological Processing API',
+        'version': '1.1.0',
         'endpoints': {
             'analyze': '/analyze-phonological (POST)',
-            'health': '/health (GET)'
+            'health': '/health (GET)',
+            'debug': '/debug-audio (POST)'
         },
         'supported_tasks': ['phoneme_deletion', 'phoneme_blending', 'nonword_repetition']
     })
