@@ -31,6 +31,9 @@ RUN mkdir -p uploads/temp models
 # Copy application code
 COPY . .
 
+# Create models directory and set up MFA models note
+RUN python -c "import os; os.makedirs('/app/models', exist_ok=True); print('MFA models will be downloaded on first run')"
+
 # Expose port
 EXPOSE 5000
 
