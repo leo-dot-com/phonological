@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
 import tempfile
@@ -14,6 +14,8 @@ import requests
 
 app = Flask(__name__)
 CORS(app)
+
+PHONEME_AUDIO_DIR = os.path.join(os.path.dirname(__file__), 'static', 'phonemes')
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -512,6 +514,10 @@ def debug_audio():
                 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/module2/phoneme-audio/<path:filename>')
+def serve_phoneme_audio(filename):
+    return send_from_directory(PHONEME_AUDIO_DIR, filename)
 
 @app.route('/', methods=['GET'])
 def home():
